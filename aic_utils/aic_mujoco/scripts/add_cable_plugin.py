@@ -777,7 +777,7 @@ def main():
         # Add cable_default
         root_default = world_spec.default
         cable_default = world_spec.add_default("cable_default", root_default)
-        cable_default.joint.damping = 0.2
+        cable_default.joint.damping[:] = 0.2
         print("Added 'cable_default' with joint damping 0.2.")
 
         # Add friction defaults for task board components (matching Gazebo SDF)
@@ -854,6 +854,10 @@ def main():
         xml_str = postprocess_world_xml(
             xml_str, gripper_plug_name, weld_relpose, cable_end_pos, cable_end_quat
         )
+
+        # Fix multi-value damping (MuJoCo 3.7 spec API writes "0.2 0.2 0.2" for
+        # ball joint defaults, but the XML parser only accepts a scalar)
+        xml_str = re.sub(r'damping="(\S+) \1 \1"', r'damping="\1"', xml_str)
 
         print(f"Saving world XML to {output_path}...")
         with open(output_path, "w") as f:

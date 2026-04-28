@@ -15,6 +15,10 @@
 #
 
 
+import logging
+import os
+from datetime import datetime
+
 import numpy as np
 
 from aic_model.policy import (
@@ -40,6 +44,18 @@ class CheatCode(Policy):
         self._tip_y_error_integrator = 0.0
         self._max_integrator_windup = 0.05
         self._task = None
+
+        log_dir = os.path.expanduser("~/cheatcode_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = os.path.join(log_dir, f"cheatcode_{ts}.log")
+        self._flog = logging.getLogger(f"CheatCode_{ts}")
+        self._flog.setLevel(logging.DEBUG)
+        handler = logging.FileHandler(log_path)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        self._flog.addHandler(handler)
+        self._flog.info(f"CheatCode log started: {log_path}")
+
         super().__init__(parent_node)
 
     def _wait_for_tf(
@@ -102,6 +118,23 @@ class CheatCode(Policy):
             q_plug[3],
         )
         q_diff = quaternion_multiply(q_port, q_plug_inv)
+
+        if not hasattr(self, '_orient_logged'):
+            self._orient_logged = True
+            import transforms3d.euler as tfe
+            def q2euler(q):
+                return tfe.quat2euler(q, axes='sxyz')
+            port_e = q2euler(q_port)
+            plug_e = q2euler(q_plug)
+            diff_e = q2euler(q_diff)
+            omsg = (
+                f"[ORIENT] q_port={q_port} euler_deg=({np.degrees(port_e[0]):.1f},{np.degrees(port_e[1]):.1f},{np.degrees(port_e[2]):.1f})\n"
+                f"[ORIENT] q_plug={q_plug} euler_deg=({np.degrees(plug_e[0]):.1f},{np.degrees(plug_e[1]):.1f},{np.degrees(plug_e[2]):.1f})\n"
+                f"[ORIENT] q_diff={q_diff} euler_deg=({np.degrees(diff_e[0]):.1f},{np.degrees(diff_e[1]):.1f},{np.degrees(diff_e[2]):.1f})"
+            )
+            self.get_logger().info(omsg)
+            self._flog.info(omsg)
+
         gripper_tf_stamped = self._parent_node._tf_buffer.lookup_transform(
             "base_link",
             "gripper/tcp",
@@ -154,20 +187,29 @@ class CheatCode(Policy):
                 self._max_integrator_windup,
             )
 
-        self.get_logger().info(
-            f"pfrac: {position_fraction:.3} xy_error: {tip_x_error:0.3} {tip_y_error:0.3}   integrators: {self._tip_x_error_integrator:.3} , {self._tip_y_error_integrator:.3}"
+        step_msg = (
+            f"pfrac: {position_fraction:.3} xy_error: {tip_x_error:0.3} {tip_y_error:0.3} "
+            f"integrators: {self._tip_x_error_integrator:.3},{self._tip_y_error_integrator:.3}"
         )
+        self.get_logger().info(step_msg)
+        self._flog.info(step_msg)
 
         i_gain = 0.15
 
         target_x = port_xy[0] + i_gain * self._tip_x_error_integrator
         target_y = port_xy[1] + i_gain * self._tip_y_error_integrator
-        target_z = port_transform.translation.z + z_offset - plug_tip_gripper_offset[2]
+        target_z = port_transform.translation.z + z_offset + plug_tip_gripper_offset[2]
 
         blend_xyz = (
             position_fraction * target_x + (1.0 - position_fraction) * gripper_xyz[0],
             position_fraction * target_y + (1.0 - position_fraction) * gripper_xyz[1],
             position_fraction * target_z + (1.0 - position_fraction) * gripper_xyz[2],
+        )
+
+        self._flog.info(
+            f"  target=({target_x:.4f},{target_y:.4f},{target_z:.4f}) "
+            f"blend=({blend_xyz[0]:.4f},{blend_xyz[1]:.4f},{blend_xyz[2]:.4f}) "
+            f"plug_offset=({plug_tip_gripper_offset[0]:.4f},{plug_tip_gripper_offset[1]:.4f},{plug_tip_gripper_offset[2]:.4f})"
         )
 
         return Pose(
@@ -213,6 +255,39 @@ class CheatCode(Policy):
             self.get_logger().error(f"Could not look up port transform: {ex}")
             return False
         port_transform = port_tf_stamped.transform
+
+        p = port_transform.translation
+        r = port_transform.rotation
+        msg = (
+            f"[GT] port in base_link: pos=({p.x:.4f}, {p.y:.4f}, {p.z:.4f}) "
+            f"quat=({r.w:.4f}, {r.x:.4f}, {r.y:.4f}, {r.z:.4f})"
+        )
+        self.get_logger().info(msg)
+        self._flog.info(msg)
+
+        try:
+            plug_init = self._parent_node._tf_buffer.lookup_transform(
+                "base_link",
+                cable_tip_frame,
+                Time(),
+            )
+            pp = plug_init.transform.translation
+            msg2 = f"[GT] plug  in base_link: pos=({pp.x:.4f}, {pp.y:.4f}, {pp.z:.4f})"
+            self.get_logger().info(msg2)
+            self._flog.info(msg2)
+
+            gripper_init = self._parent_node._tf_buffer.lookup_transform(
+                "base_link",
+                "gripper/tcp",
+                Time(),
+            )
+            gp = gripper_init.transform.translation
+            msg3 = f"[GT] gripper/tcp in base_link: pos=({gp.x:.4f}, {gp.y:.4f}, {gp.z:.4f})"
+            self.get_logger().info(msg3)
+            self._flog.info(msg3)
+        except TransformException as ex:
+            self.get_logger().warn(f"[GT] debug lookup failed: {ex}")
+            self._flog.warning(f"[GT] debug lookup failed: {ex}")
 
         z_offset = 0.2
 

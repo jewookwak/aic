@@ -20,6 +20,7 @@ import inspect
 import numpy as np
 import rclpy
 import threading
+import traceback
 
 from aic_control_interfaces.msg import (
     JointMotionUpdate,
@@ -120,9 +121,12 @@ class AicModel(LifecycleNode):
         self.get_logger().info(f"Instantiating policy...")
         try:
             self._policy = self._policy_class(self)
-        except Exception as e:
-            self.get_logger().error(f"Error instantiating policy: {e}")
+        except BaseException as e:
+            self.get_logger().error(
+                f"Error instantiating policy: {e}\n{traceback.format_exc()}"
+            )
             return TransitionCallbackReturn.ERROR
+        self.get_logger().info("Policy instantiated successfully.")
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state: LifecycleState) -> TransitionCallbackReturn:

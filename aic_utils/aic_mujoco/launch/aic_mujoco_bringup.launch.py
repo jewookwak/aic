@@ -59,6 +59,7 @@ def launch_setup(context, *args, **kwargs):
     robot_roll = LaunchConfiguration("robot_roll")
     robot_pitch = LaunchConfiguration("robot_pitch")
     robot_yaw = LaunchConfiguration("robot_yaw")
+    ground_truth = LaunchConfiguration("ground_truth")
 
     gripper_initial_pos = "0.00655"
 
@@ -195,6 +196,14 @@ def launch_setup(context, *args, **kwargs):
         executable="aic_adapter",
     )
 
+    ground_truth_tf_publisher = Node(
+        package="aic_mujoco",
+        executable="mujoco_ground_truth_tf.py",
+        name="mujoco_ground_truth_tf",
+        output="screen",
+        condition=IfCondition(ground_truth),
+    )
+
     # Delay rviz start after `joint_state_broadcaster`
     delay_rviz_after_joint_state_broadcaster_spawner = RegisterEventHandler(
         event_handler=OnProcessExit(
@@ -294,6 +303,7 @@ def launch_setup(context, *args, **kwargs):
         delay_initial_joint_controller,
         delay_rviz_after_joint_state_broadcaster_spawner,
         aic_adapter,
+        ground_truth_tf_publisher,
     ]
 
     return nodes_to_start
@@ -440,8 +450,15 @@ def generate_launch_description():
     declared_arguments.append(
         DeclareLaunchArgument(
             "robot_yaw",
-            default_value="-3.141",
+            default_value="0.0",
             description="Robot spawn yaw orientation (radians)",
+        )
+    )
+    declared_arguments.append(
+        DeclareLaunchArgument(
+            "ground_truth",
+            default_value="false",
+            description="Whether to launch the ground truth TF publisher for CheatCode",
         )
     )
 

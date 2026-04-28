@@ -311,6 +311,8 @@ Engine::Engine(const rclcpp::NodeOptions& options)
   skip_model_ready_ = node_->declare_parameter("skip_model_ready", false);
   skip_ready_simulator_ =
       node_->declare_parameter("skip_ready_simulator", false);
+  skip_check_endpoints_ =
+      node_->declare_parameter("skip_check_endpoints", false);
   node_->declare_parameter("model_discovery_timeout_seconds", 30);
   node_->declare_parameter("model_configure_timeout_seconds", 60);
   node_->declare_parameter("model_activate_timeout_seconds", 60);
@@ -705,6 +707,12 @@ TrialScore Engine::handle_trial(Trial& trial) {
                 trial.id.c_str());
     score.tier_1_success();
     bool success = false;
+    if (skip_check_endpoints_) {
+      RCLCPP_INFO(node_->get_logger(),
+                  "Skipping check_endpoints (skip_check_endpoints=true)");
+      trial.state = TrialState::EndpointsReady;
+      success = true;
+    }
     for (int attempt = 1; attempt <= MAX_RETRIES && !success; ++attempt) {
       if (attempt > 1) {
         RCLCPP_WARN(node_->get_logger(),

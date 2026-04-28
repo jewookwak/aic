@@ -390,6 +390,7 @@ class Engine {
   // Parameters to skip states for testing purposes.
   bool skip_model_ready_;
   bool skip_ready_simulator_;
+  bool skip_check_endpoints_;
 
   // Whether the participant model has been discovered and readied.
   bool model_discovered_;

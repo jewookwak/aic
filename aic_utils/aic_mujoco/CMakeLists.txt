@@ -20,6 +20,8 @@ install(PROGRAMS
   scripts/view_scene.py
   scripts/load_aic_world.py
   scripts/sim_comparison_test.py
+  scripts/mujoco_ground_truth_tf.py
+  scripts/trigger_policy.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
