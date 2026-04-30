@@ -9,11 +9,19 @@ Observation space (Dict, HER-compatible):
   desired_goal  : port position in base_link frame (3-dim)
 
 Action space:
-  6-dim Cartesian velocity [vx, vy, vz, wx, wy, wz], clipped to [-0.1, 0.1]
+  6-dim Cartesian velocity [vx, vy, vz, wx, wy, wz], clipped to [-0.05, 0.05]
 
-Reward:
-  Dense: -||achieved_goal - desired_goal||
-  Sparse bonus: +10 if distance < success_threshold
+Reward (5-stage):
+  Dense base   : -||achieved_goal - desired_goal||  (항상 활성, HER 호환)
+  Stage 1 (+1) : 방향 정렬  — 플러그↔포트 자세 오차 < 25°
+  Stage 2 (+1) : X축 정렬  — 포트 로컬 X 오차 < 10mm
+  Stage 3 (+1) : Y축 정렬  — 포트 로컬 Y 오차 < 10mm
+  Stage 4 (+2) : 삽입 전   — X·Y 모두 < 5mm (삽입 축 진입 준비 완료)
+  Stage 5 (+5) : 삽입 성공 — 전체 거리 < 3mm
+
+  단계 보상은 에피소드 내 최초 달성 시 1회만 지급 (누적 달성 추적).
+  포트 로컬 프레임 기준으로 축별 오차를 분리하므로, 삽입 방향(Z)과
+  측면(X, Y)을 독립적으로 가이드할 수 있습니다.
 """
 
 import time
@@ -28,15 +36,46 @@ from rclpy.executors import MultiThreadedExecutor
 
 from aic_model_interfaces.msg import Observation
 from aic_control_interfaces.msg import MotionUpdate, TrajectoryGenerationMode
-from aic_control_interfaces.srv import ChangeTargetMode
 from geometry_msgs.msg import Twist, Vector3, Wrench
 from std_msgs.msg import Header
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 
 
+# ---------------------------------------------------------------------------
+# 회전 유틸 (scipy 없이 numpy만 사용)
+# ---------------------------------------------------------------------------
+
+def _quat_to_rot(q: np.ndarray) -> np.ndarray:
+    """쿼터니언 [x, y, z, w] → 3×3 회전 행렬."""
+    x, y, z, w = q / np.linalg.norm(q)
+    return np.array([
+        [1 - 2*(y*y + z*z),   2*(x*y - z*w),     2*(x*z + y*w)],
+        [2*(x*y + z*w),       1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w),       2*(y*z + x*w),     1 - 2*(x*x + y*y)],
+    ], dtype=np.float64)
+
+
+def _quat_angle_diff(q1: np.ndarray, q2: np.ndarray) -> float:
+    """두 쿼터니언 사이 각도 차이 (라디안)."""
+    q1 = q1 / np.linalg.norm(q1)
+    q2 = q2 / np.linalg.norm(q2)
+    dot = float(np.clip(np.abs(np.dot(q1, q2)), 0.0, 1.0))
+    return 2.0 * np.arccos(dot)
+
+
+def _to_local_frame(vec_world: np.ndarray, frame_quat: np.ndarray) -> np.ndarray:
+    """world 벡터를 frame_quat 로컬 프레임으로 변환 (R^T * v)."""
+    R = _quat_to_rot(frame_quat)
+    return R.T @ vec_world
+
+
+# ---------------------------------------------------------------------------
+# ROS2 통신 노드
+# ---------------------------------------------------------------------------
+
 class AICEnvNode(Node):
-    """ROS2 node that handles communication with the simulator."""
+    """시뮬레이터와의 ROS2 통신을 담당하는 노드."""
 
     def __init__(self):
         super().__init__("aic_env_node")
@@ -61,7 +100,7 @@ class AICEnvNode(Node):
             return self._latest_obs
 
     def send_velocity(self, action: np.ndarray, frame_id: str = "base_link"):
-        """Publish 6-dim velocity action as MotionUpdate."""
+        """6-dim velocity action → MotionUpdate 발행."""
         msg = MotionUpdate()
         msg.header = Header(
             frame_id=frame_id,
@@ -81,59 +120,80 @@ class AICEnvNode(Node):
         msg.trajectory_generation_mode.mode = TrajectoryGenerationMode.MODE_VELOCITY
         self._motion_pub.publish(msg)
 
-    def get_tf(self, target_frame: str, source_frame: str = "base_link"):
-        """Look up transform. Returns (position np.array, None) or (None, None) on fail."""
+    def get_tf_pos(self, target_frame: str, source_frame: str = "base_link") -> np.ndarray | None:
+        """위치만 반환 (3-dim)."""
         try:
-            t = self._tf_buffer.lookup_transform(
-                source_frame, target_frame, rclpy.time.Time()
-            )
-            pos = t.transform.translation
-            return np.array([pos.x, pos.y, pos.z])
+            t = self._tf_buffer.lookup_transform(source_frame, target_frame, rclpy.time.Time())
+            tr = t.transform.translation
+            return np.array([tr.x, tr.y, tr.z], dtype=np.float64)
         except Exception:
             return None
 
+    def get_tf_pose(self, target_frame: str, source_frame: str = "base_link"):
+        """위치(3) + 쿼터니언(4, [x,y,z,w]) 반환. 실패 시 (None, None)."""
+        try:
+            t = self._tf_buffer.lookup_transform(source_frame, target_frame, rclpy.time.Time())
+            tr = t.transform.translation
+            ro = t.transform.rotation
+            pos = np.array([tr.x, tr.y, tr.z], dtype=np.float64)
+            quat = np.array([ro.x, ro.y, ro.z, ro.w], dtype=np.float64)
+            return pos, quat
+        except Exception:
+            return None, None
+
+
+# ---------------------------------------------------------------------------
+# Gymnasium 환경
+# ---------------------------------------------------------------------------
 
 class AICEnv(gym.Env):
     """
-    Gymnasium environment for AIC cable insertion training with TQC.
+    AIC 케이블 삽입 학습용 Gymnasium 환경 (TQC + HER).
 
-    Requires the MuJoCo simulation to be running:
+    실행 전 MuJoCo 시뮬레이터가 필요합니다:
       ros2 launch aic_mujoco aic_mujoco_bringup.launch.py ground_truth:=true
     """
 
     metadata = {"render_modes": []}
 
-    # TF frame names (matches CLAUDE.md conventions)
+    # TF 프레임 이름 (CLAUDE.md 규칙)
     PLUG_FRAME = "cable_0/sfp_tip_link"
     PORT_FRAME = "task_board/nic_card_mount_0/sfp_port_0_link"
 
-    SUCCESS_THRESHOLD = 0.005  # 5mm
+    # 단계 보상 설정
+    # 포트 로컬 프레임 기준 (Z = 삽입 축, X·Y = 측면)
+    STAGE_REWARDS = {
+        "orientation": 1.0,   # Stage 1: 방향 정렬
+        "x_align":     1.0,   # Stage 2: X 측면 정렬
+        "y_align":     1.0,   # Stage 3: Y 측면 정렬
+        "pre_insert":  2.0,   # Stage 4: 삽입 전 준비 (X·Y 세밀 정렬)
+        "success":     5.0,   # Stage 5: 삽입 성공
+    }
+
+    ORIENT_THRESH     = np.radians(25)  # Stage 1: 25°
+    LATERAL_COARSE    = 0.010           # Stage 2·3: 10mm
+    LATERAL_FINE      = 0.005           # Stage 4: 5mm
+    SUCCESS_THRESH    = 0.003           # Stage 5: 3mm
+
     MAX_STEPS = 500
-    VEL_LIMIT = 0.05           # m/s and rad/s
+    VEL_LIMIT = 0.05
 
     def __init__(self):
         super().__init__()
 
-        # --- Observation space (HER-compatible Dict) ---
-        obs_dim = 26
-        goal_dim = 3
-        self.observation_space = spaces.Dict(
-            {
-                "observation": spaces.Box(-np.inf, np.inf, (obs_dim,), np.float32),
-                "achieved_goal": spaces.Box(-np.inf, np.inf, (goal_dim,), np.float32),
-                "desired_goal": spaces.Box(-np.inf, np.inf, (goal_dim,), np.float32),
-            }
-        )
+        # 관측 공간 (HER 호환 Dict)
+        self.observation_space = spaces.Dict({
+            "observation":  spaces.Box(-np.inf, np.inf, (26,), np.float32),
+            "achieved_goal": spaces.Box(-np.inf, np.inf, (3,),  np.float32),
+            "desired_goal":  spaces.Box(-np.inf, np.inf, (3,),  np.float32),
+        })
 
-        # --- Action space: 6-dim Cartesian velocity ---
+        # 행동 공간: 6-dim Cartesian 속도
         self.action_space = spaces.Box(
-            low=-self.VEL_LIMIT,
-            high=self.VEL_LIMIT,
-            shape=(6,),
-            dtype=np.float32,
+            low=-self.VEL_LIMIT, high=self.VEL_LIMIT, shape=(6,), dtype=np.float32
         )
 
-        # --- ROS2 setup ---
+        # ROS2 초기화
         if not rclpy.ok():
             rclpy.init()
         self._node = AICEnvNode()
@@ -142,11 +202,17 @@ class AICEnv(gym.Env):
         self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
         self._spin_thread.start()
 
+        # 에피소드 상태
         self._step_count = 0
-        self._desired_goal = None
+        self._port_pos: np.ndarray | None = None    # reset 시 캐시
+        self._port_quat: np.ndarray | None = None   # reset 시 캐시
+        self._achieved_stages: set[str] = set()
 
-        # Wait for first observation
         self._wait_for_obs(timeout=10.0)
+
+    # ------------------------------------------------------------------
+    # 내부 헬퍼
+    # ------------------------------------------------------------------
 
     def _wait_for_obs(self, timeout=10.0):
         deadline = time.time() + timeout
@@ -154,9 +220,11 @@ class AICEnv(gym.Env):
             if self._node.get_observation() is not None:
                 return
             time.sleep(0.1)
-        raise RuntimeError("No observation received within timeout. Is the simulation running?")
+        raise RuntimeError(
+            "관측값을 받지 못했습니다. 시뮬레이터가 실행 중인지 확인하세요."
+        )
 
-    def _get_obs_dict(self) -> dict:
+    def _build_obs_dict(self) -> dict:
         obs_msg = self._node.get_observation()
         tcp_pose = obs_msg.controller_state.tcp_pose
         tcp_vel = obs_msg.controller_state.tcp_velocity
@@ -171,52 +239,134 @@ class AICEnv(gym.Env):
             *list(obs_msg.joint_states.position[:7]),
         ], dtype=np.float32)
 
-        plug_pos = self._node.get_tf(self.PLUG_FRAME)
-        port_pos = self._node.get_tf(self.PORT_FRAME)
-
-        achieved_goal = plug_pos if plug_pos is not None else np.zeros(3, np.float32)
-        desired_goal = port_pos if port_pos is not None else np.zeros(3, np.float32)
-
-        if self._desired_goal is not None:
-            desired_goal = self._desired_goal
+        plug_pos = self._node.get_tf_pos(self.PLUG_FRAME)
+        achieved_goal = plug_pos.astype(np.float32) if plug_pos is not None else np.zeros(3, np.float32)
+        desired_goal = self._port_pos.astype(np.float32) if self._port_pos is not None else np.zeros(3, np.float32)
 
         return {
             "observation": state,
-            "achieved_goal": achieved_goal.astype(np.float32),
-            "desired_goal": desired_goal.astype(np.float32),
+            "achieved_goal": achieved_goal,
+            "desired_goal": desired_goal,
         }
 
-    def compute_reward(self, achieved_goal, desired_goal, info):
+    def _compute_staged_reward(
+        self,
+        plug_pos: np.ndarray,
+        plug_quat: np.ndarray | None,
+    ) -> float:
+        """
+        5단계 보상 계산. 각 단계는 에피소드 내 최초 달성 시 1회만 지급.
+
+        포트 로컬 프레임으로 변환해 축별 오차를 분리합니다:
+          local[0] = X (측면 좌우)
+          local[1] = Y (측면 상하)
+          local[2] = Z (삽입 깊이 축)
+        """
+        if self._port_pos is None or self._port_quat is None:
+            return 0.0
+
+        bonus = 0.0
+
+        # --- Stage 1: 방향 정렬 ---
+        if "orientation" not in self._achieved_stages and plug_quat is not None:
+            angle_err = _quat_angle_diff(plug_quat, self._port_quat)
+            if angle_err < self.ORIENT_THRESH:
+                self._achieved_stages.add("orientation")
+                bonus += self.STAGE_REWARDS["orientation"]
+
+        # 포트 로컬 프레임 기준 오차 벡터
+        pos_err_world = plug_pos - self._port_pos
+        err_local = _to_local_frame(pos_err_world, self._port_quat)  # [ex, ey, ez]
+
+        # --- Stage 2: X축 측면 정렬 ---
+        if "x_align" not in self._achieved_stages:
+            if abs(err_local[0]) < self.LATERAL_COARSE:
+                self._achieved_stages.add("x_align")
+                bonus += self.STAGE_REWARDS["x_align"]
+
+        # --- Stage 3: Y축 측면 정렬 ---
+        if "y_align" not in self._achieved_stages:
+            if abs(err_local[1]) < self.LATERAL_COARSE:
+                self._achieved_stages.add("y_align")
+                bonus += self.STAGE_REWARDS["y_align"]
+
+        # --- Stage 4: 삽입 전 준비 (X·Y 세밀 정렬, Z 접근) ---
+        # X·Y가 이미 coarse 달성 후, fine 수준까지 좁혀졌을 때
+        if "pre_insert" not in self._achieved_stages:
+            xy_fine = abs(err_local[0]) < self.LATERAL_FINE and abs(err_local[1]) < self.LATERAL_FINE
+            if xy_fine:
+                self._achieved_stages.add("pre_insert")
+                bonus += self.STAGE_REWARDS["pre_insert"]
+
+        # --- Stage 5: 삽입 성공 ---
+        if "success" not in self._achieved_stages:
+            total_dist = float(np.linalg.norm(pos_err_world))
+            if total_dist < self.SUCCESS_THRESH:
+                self._achieved_stages.add("success")
+                bonus += self.STAGE_REWARDS["success"]
+
+        return bonus
+
+    # ------------------------------------------------------------------
+    # HER 호환 compute_reward (위치 기반 dense, 항상 활성)
+    # ------------------------------------------------------------------
+
+    def compute_reward(
+        self,
+        achieved_goal: np.ndarray,
+        desired_goal: np.ndarray,
+        info: dict,
+    ) -> np.ndarray:
+        """HER가 가상 목표로 보상을 재계산할 때 사용. 단계 보상 제외."""
         dist = np.linalg.norm(achieved_goal - desired_goal, axis=-1)
-        reward = -dist
-        reward = np.where(dist < self.SUCCESS_THRESHOLD, reward + 10.0, reward)
-        return reward.astype(np.float32)
+        return (-dist).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Gymnasium API
+    # ------------------------------------------------------------------
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self._step_count = 0
+        self._achieved_stages = set()
 
-        # Cache port position at episode start as desired goal
-        port_pos = self._node.get_tf(self.PORT_FRAME)
-        self._desired_goal = port_pos.astype(np.float32) if port_pos is not None else None
+        # 포트 위치·자세를 에피소드 시작 시 한 번 캐시
+        pos, quat = self._node.get_tf_pose(self.PORT_FRAME)
+        self._port_pos = pos
+        self._port_quat = quat
 
-        obs = self._get_obs_dict()
+        obs = self._build_obs_dict()
         return obs, {}
 
     def step(self, action: np.ndarray):
         action = np.clip(action, -self.VEL_LIMIT, self.VEL_LIMIT)
         self._node.send_velocity(action)
-        time.sleep(0.05)  # ~20Hz control loop (adjust to match sim rate)
+        time.sleep(0.05)  # 20Hz 제어 주기
 
         self._step_count += 1
-        obs = self._get_obs_dict()
+        obs = self._build_obs_dict()
 
-        reward = float(self.compute_reward(obs["achieved_goal"], obs["desired_goal"], {}))
-        dist = np.linalg.norm(obs["achieved_goal"] - obs["desired_goal"])
-        terminated = bool(dist < self.SUCCESS_THRESHOLD)
+        # 플러그 위치·자세 조회 (단계 보상 계산용)
+        plug_pos, plug_quat = self._node.get_tf_pose(self.PLUG_FRAME)
+        if plug_pos is None:
+            plug_pos = obs["achieved_goal"].astype(np.float64)
+            plug_quat = None
+
+        # 보상 = dense base + 단계 보너스
+        dist = float(np.linalg.norm(obs["achieved_goal"] - obs["desired_goal"]))
+        dense_reward = -dist
+        stage_bonus = self._compute_staged_reward(plug_pos, plug_quat)
+        reward = dense_reward + stage_bonus
+
+        terminated = "success" in self._achieved_stages
         truncated = self._step_count >= self.MAX_STEPS
 
-        info = {"distance": dist, "is_success": terminated}
+        info = {
+            "distance":       dist,
+            "is_success":     terminated,
+            "stages_achieved": list(self._achieved_stages),
+            "stage_bonus":    stage_bonus,
+        }
         return obs, reward, terminated, truncated, info
 
     def close(self):
