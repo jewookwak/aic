@@ -65,11 +65,12 @@ class RunTQC(Policy):
 
     @staticmethod
     def _ros_img_to_uint8(ros_img, size=(84, 84)) -> np.ndarray:
+        """ROS Image → (3, H, W) uint8. obs space (C,H,W) 형식과 일치."""
         import cv2
         arr = np.frombuffer(ros_img.data, dtype=np.uint8).reshape(ros_img.height, ros_img.width, 3)
         if arr.shape[:2] != size:
             arr = cv2.resize(arr, (size[1], size[0]), interpolation=cv2.INTER_AREA)
-        return arr
+        return arr.transpose(2, 0, 1)  # (H, W, 3) → (3, H, W)
 
     def _obs_to_sb3(self, obs_msg, desired_goal: np.ndarray) -> dict:
         """AIC Observation → SB3 Dict 형식 변환 (aic_env.py와 동일 포맷)."""

@@ -130,11 +130,12 @@ class ACTFeaturesExtractor(BaseFeaturesExtractor):
 
     def _preprocess_img(self, img: torch.Tensor, obs_key: str) -> torch.Tensor:
         """
-        SB3가 uint8 이미지를 [0,1] float로 정규화한 후 전달합니다.
-        여기서는 (B, H, W, C) → (B, C, H, W) 변환 후 ACT stats 적용.
+        입력: (B, C, H, W) uint8 또는 float — obs space를 (C,H,W)로 정의했으므로
+        SB3가 VecTransposeImage 변환 없이 그대로 전달.
+        처리: [0,255] → [0,1] float → ACT mean/std 정규화 → 리사이즈.
         """
-        # (B, H, W, C) → (B, C, H, W)
-        x = img.float().permute(0, 3, 1, 2)
+        # uint8 → float [0, 1]
+        x = img.float() / 255.0  # (B, C, H, W)
 
         # 리사이즈
         if x.shape[-2:] != self.img_size:

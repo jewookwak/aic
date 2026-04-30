@@ -204,7 +204,8 @@ class AICEnv(gym.Env):
         }
         if use_images:
             H, W = self.IMG_SIZE
-            img_space = spaces.Box(0, 255, (H, W, 3), dtype=np.uint8)
+            # (C, H, W) 형식 — SB3의 VecTransposeImage 자동 변환 방지
+            img_space = spaces.Box(0, 255, (3, H, W), dtype=np.uint8)
             obs_dict["left_image"]   = img_space
             obs_dict["center_image"] = img_space
             obs_dict["right_image"]  = img_space
@@ -248,12 +249,12 @@ class AICEnv(gym.Env):
 
     @staticmethod
     def _ros_image_to_uint8(ros_img, size: tuple[int, int]) -> np.ndarray:
-        """ROS Image → (H, W, 3) uint8, 리사이즈 포함."""
+        """ROS Image → (3, H, W) uint8, 리사이즈 포함. (C,H,W) 형식."""
         import cv2
         arr = np.frombuffer(ros_img.data, dtype=np.uint8).reshape(ros_img.height, ros_img.width, 3)
         if arr.shape[:2] != size:
             arr = cv2.resize(arr, (size[1], size[0]), interpolation=cv2.INTER_AREA)
-        return arr
+        return arr.transpose(2, 0, 1)  # (H, W, 3) → (3, H, W)
 
     def _build_obs_dict(self) -> dict:
         obs_msg = self._node.get_observation()
