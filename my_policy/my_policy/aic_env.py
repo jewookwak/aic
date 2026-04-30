@@ -11,6 +11,10 @@ Observation space (Dict, HER-compatible):
 Action space:
   6-dim Cartesian velocity [vx, vy, vz, wx, wy, wz], clipped to [-0.05, 0.05]
 
+Image observations (optional, for ACT encoder):
+  left_image, center_image, right_image : (IMG_H, IMG_W, 3) uint8
+  IMG_SIZE = (84, 84) 기본값 (메모리 vs 품질 트레이드오프)
+
 Reward (5-stage):
   Dense base   : -||achieved_goal - desired_goal||  (항상 활성, HER 호환)
   Stage 1 (+1) : 방향 정렬  — 플러그↔포트 자세 오차 < 25°
@@ -178,15 +182,33 @@ class AICEnv(gym.Env):
     MAX_STEPS = 500
     VEL_LIMIT = 0.05
 
-    def __init__(self):
+    # 이미지 크기: (H, W). 메모리 vs 품질 트레이드오프
+    # 84×84 uint8: ~21KB/cam, 3cam×100K step buffer ≈ 6.3GB
+    # 160×120 uint8: ~58KB/cam, 3cam×100K step buffer ≈ 17GB
+    IMG_SIZE: tuple[int, int] = (84, 84)
+
+    def __init__(self, use_images: bool = True):
+        """
+        Args:
+            use_images: True면 카메라 이미지를 관측에 포함 (ACTFeaturesExtractor 필요).
+                        False면 상태 벡터만 사용 (기본 MLP TQC).
+        """
         super().__init__()
+        self.use_images = use_images
 
         # 관측 공간 (HER 호환 Dict)
-        self.observation_space = spaces.Dict({
-            "observation":  spaces.Box(-np.inf, np.inf, (26,), np.float32),
+        obs_dict = {
+            "observation":   spaces.Box(-np.inf, np.inf, (26,), np.float32),
             "achieved_goal": spaces.Box(-np.inf, np.inf, (3,),  np.float32),
             "desired_goal":  spaces.Box(-np.inf, np.inf, (3,),  np.float32),
-        })
+        }
+        if use_images:
+            H, W = self.IMG_SIZE
+            img_space = spaces.Box(0, 255, (H, W, 3), dtype=np.uint8)
+            obs_dict["left_image"]   = img_space
+            obs_dict["center_image"] = img_space
+            obs_dict["right_image"]  = img_space
+        self.observation_space = spaces.Dict(obs_dict)
 
         # 행동 공간: 6-dim Cartesian 속도
         self.action_space = spaces.Box(
@@ -224,6 +246,15 @@ class AICEnv(gym.Env):
             "관측값을 받지 못했습니다. 시뮬레이터가 실행 중인지 확인하세요."
         )
 
+    @staticmethod
+    def _ros_image_to_uint8(ros_img, size: tuple[int, int]) -> np.ndarray:
+        """ROS Image → (H, W, 3) uint8, 리사이즈 포함."""
+        import cv2
+        arr = np.frombuffer(ros_img.data, dtype=np.uint8).reshape(ros_img.height, ros_img.width, 3)
+        if arr.shape[:2] != size:
+            arr = cv2.resize(arr, (size[1], size[0]), interpolation=cv2.INTER_AREA)
+        return arr
+
     def _build_obs_dict(self) -> dict:
         obs_msg = self._node.get_observation()
         tcp_pose = obs_msg.controller_state.tcp_pose
@@ -243,11 +274,18 @@ class AICEnv(gym.Env):
         achieved_goal = plug_pos.astype(np.float32) if plug_pos is not None else np.zeros(3, np.float32)
         desired_goal = self._port_pos.astype(np.float32) if self._port_pos is not None else np.zeros(3, np.float32)
 
-        return {
-            "observation": state,
+        obs = {
+            "observation":   state,
             "achieved_goal": achieved_goal,
-            "desired_goal": desired_goal,
+            "desired_goal":  desired_goal,
         }
+
+        if self.use_images:
+            obs["left_image"]   = self._ros_image_to_uint8(obs_msg.left_image,   self.IMG_SIZE)
+            obs["center_image"] = self._ros_image_to_uint8(obs_msg.center_image, self.IMG_SIZE)
+            obs["right_image"]  = self._ros_image_to_uint8(obs_msg.right_image,  self.IMG_SIZE)
+
+        return obs
 
     def _compute_staged_reward(
         self,

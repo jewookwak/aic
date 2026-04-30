@@ -29,7 +29,11 @@ from aic_task_interfaces.msg import Task
 
 
 # 학습된 모델 경로 (train_tqc.py 실행 후 생성)
-DEFAULT_MODEL_PATH = "models/tqc_aic/tqc_aic_final.zip"
+# 모드별 기본 모델 경로
+DEFAULT_MODEL_PATHS = {
+    "state": "models/tqc_aic_state/tqc_aic_state_final.zip",
+    "image": "models/tqc_aic_image/tqc_aic_image_final.zip",
+}
 
 # 포트 TF 프레임 (CLAUDE.md 규칙)
 PORT_FRAME_TEMPLATE = "task_board/{target_module_name}/{port_name}_link"
@@ -40,20 +44,32 @@ SUCCESS_THRESHOLD = 0.005  # 5mm
 
 
 class RunTQC(Policy):
+    # "state" 또는 "image" — train_tqc.py의 --mode와 일치해야 함
+    MODE = "image"
+
     def __init__(self, parent_node):
         super().__init__(parent_node)
 
-        model_path = DEFAULT_MODEL_PATH
+        model_path = DEFAULT_MODEL_PATHS[self.MODE]
         if not Path(model_path).exists():
             raise FileNotFoundError(
                 f"학습된 모델을 찾을 수 없습니다: {model_path}\n"
-                "먼저 학습을 실행하세요:\n"
-                "  pixi run python3 my_policy/scripts/train_tqc.py"
+                f"먼저 학습을 실행하세요:\n"
+                f"  pixi run python3 my_policy/scripts/train_tqc.py --mode {self.MODE}"
             )
 
+        self.use_images = (self.MODE == "image")
         self.model = TQC.load(model_path, device="cuda")
         self.model.set_env(None)
-        self.get_logger().info(f"TQC 모델 로드 완료: {model_path}")
+        self.get_logger().info(f"TQC 모델 로드 완료 (mode={self.MODE}): {model_path}")
+
+    @staticmethod
+    def _ros_img_to_uint8(ros_img, size=(84, 84)) -> np.ndarray:
+        import cv2
+        arr = np.frombuffer(ros_img.data, dtype=np.uint8).reshape(ros_img.height, ros_img.width, 3)
+        if arr.shape[:2] != size:
+            arr = cv2.resize(arr, (size[1], size[0]), interpolation=cv2.INTER_AREA)
+        return arr
 
     def _obs_to_sb3(self, obs_msg, desired_goal: np.ndarray) -> dict:
         """AIC Observation → SB3 Dict 형식 변환 (aic_env.py와 동일 포맷)."""
@@ -76,11 +92,16 @@ class RunTQC(Policy):
             tcp_pose.position.z,
         ], dtype=np.float32)
 
-        return {
-            "observation": state[np.newaxis],         # (1, 26)
-            "achieved_goal": achieved_goal[np.newaxis],  # (1, 3)
-            "desired_goal": desired_goal[np.newaxis],    # (1, 3)
+        obs = {
+            "observation":   state[np.newaxis],            # (1, 26)
+            "achieved_goal": achieved_goal[np.newaxis],    # (1, 3)
+            "desired_goal":  desired_goal[np.newaxis],     # (1, 3)
         }
+        if self.use_images:
+            obs["left_image"]   = self._ros_img_to_uint8(obs_msg.left_image)[np.newaxis]
+            obs["center_image"] = self._ros_img_to_uint8(obs_msg.center_image)[np.newaxis]
+            obs["right_image"]  = self._ros_img_to_uint8(obs_msg.right_image)[np.newaxis]
+        return obs
 
     def _action_to_motion_update(self, action: np.ndarray) -> MotionUpdate:
         """6-dim velocity → MotionUpdate 변환."""
