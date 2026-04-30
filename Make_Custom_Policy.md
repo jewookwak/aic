@@ -264,20 +264,36 @@ cd ~/ws_aic/src/aic
 pixi install
 ```
 
-### 학습 명령어
+### 학습 명령어 (MuJoCo 로컬 환경)
+
+**터미널 1** — 패키지 설치 및 MuJoCo 시뮬레이터 시작:
 
 ```bash
-# 터미널 1: MuJoCo 시뮬레이터 실행 (ground_truth 필수)
-ros2 launch aic_mujoco aic_mujoco_bringup.launch.py ground_truth:=true
+cd ~/ws_aic/src/aic && pixi install
+```
 
-# 터미널 2: TQC 학습 시작 (~1M 스텝, GPU 권장)
-pixi run python3 my_policy/scripts/train_tqc.py
+설치 완료 후:
 
-# 학습 재개
-pixi run python3 my_policy/scripts/train_tqc.py --resume logs/tqc_aic/best_model.zip
+```bash
+cd ~/ws_aic/src/aic && pixi run ros2 launch aic_mujoco aic_mujoco_bringup.launch.py ground_truth:=true
+```
 
-# TensorBoard로 학습 모니터링
-pixi run tensorboard --logdir logs/tqc_aic
+**터미널 2** — TQC 학습 시작 (~1M 스텝, GPU 권장):
+
+```bash
+cd ~/ws_aic/src/aic && pixi run python3 my_policy/scripts/train_tqc.py
+```
+
+학습 재개 시:
+
+```bash
+cd ~/ws_aic/src/aic && pixi run python3 my_policy/scripts/train_tqc.py --resume logs/tqc_aic/best_model.zip
+```
+
+**터미널 3** — TensorBoard 모니터링 (선택):
+
+```bash
+cd ~/ws_aic/src/aic && pixi run tensorboard --logdir logs/tqc_aic
 ```
 
 학습 완료 후 생성 파일:
@@ -287,19 +303,51 @@ logs/tqc_aic/best_model.zip         ← 평가 기준 최고 모델
 logs/tqc_aic/evaluations.npz        ← 평가 기록
 ```
 
-### 추론 (학습 후 실행)
+---
+
+### 추론 명령어
+
+#### MuJoCo 로컬 테스트
+
+**터미널 1** — MuJoCo 시뮬레이터:
 
 ```bash
-# 터미널 1: 시뮬레이터
-ros2 launch aic_mujoco aic_mujoco_bringup.launch.py ground_truth:=true
+cd ~/ws_aic/src/aic && pixi run ros2 launch aic_mujoco aic_mujoco_bringup.launch.py ground_truth:=true
+```
 
-# 터미널 2: RunTQC Policy 실행
-pixi run ros2 run aic_model aic_model --ros-args \
-  -p use_sim_time:=true \
-  -p policy:=my_policy.RunTQC
+**터미널 2** — RunTQC 정책
+(미리 준비 후 `Retrying...` 보이면 Enter):
 
-# 터미널 3: 정책 트리거
+```bash
+cd ~/ws_aic/src/aic && pixi run ros2 run aic_model aic_model --ros-args -p use_sim_time:=true -p policy:=my_policy.RunTQC
+```
+
+**터미널 3** — 정책 트리거:
+
+```bash
 python3 ~/ws_aic/src/aic/aic_utils/aic_mujoco/scripts/trigger_policy.py
+```
+
+#### Gazebo 평가 환경 (제출용)
+
+**터미널 1** — 컨테이너 진입 및 시뮬레이션 시작:
+
+```bash
+export DBX_CONTAINER_MANAGER=docker
+distrobox enter -r aic_eval
+```
+
+컨테이너 안에서:
+
+```bash
+/entrypoint.sh ground_truth:=false start_aic_engine:=true
+```
+
+**터미널 2** — RunTQC 정책
+(미리 준비 후 `Retrying...` 보이면 Enter):
+
+```bash
+cd ~/ws_aic/src/aic && pixi run ros2 run aic_model aic_model --ros-args -p use_sim_time:=true -p policy:=my_policy.RunTQC
 ```
 
 ### 전체 데이터 흐름
