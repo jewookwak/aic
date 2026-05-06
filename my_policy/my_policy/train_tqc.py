@@ -146,7 +146,7 @@ def train(mode: str = "state", resume_path: str | None = None):
             policy_kwargs=policy_kwargs,
             learning_rate=lr,
             buffer_size=buffer_size,
-            learning_starts=5_000,
+            learning_starts=1_000,
             batch_size=batch_size,
             tau=0.05,
             gamma=0.98,

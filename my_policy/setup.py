@@ -16,4 +16,9 @@ setup(
     maintainer_email="your@email.com",
     description="My custom policy for the AIC challenge",
     license="Apache-2.0",
+    entry_points={
+        "console_scripts": [
+            "train_tqc = my_policy.train_tqc:main",
+        ],
+    },
 )

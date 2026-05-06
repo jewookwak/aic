@@ -372,3 +372,79 @@ RunTQC.insert_cable()
         ├─ action → MotionUpdate → move_robot()
         └─ 거리 < 5mm → 성공 종료
 ```
+
+---
+
+## 10. 트러블슈팅 (AICEnv 학습 환경)
+
+### 문제 1: Zenoh 연결 실패 (pixi ↔ distrobox)
+
+**증상**: `[AICEnv] /observations publisher 없음` 또는 30초 후 RuntimeError
+
+**원인**: `aic_zenoh_config.json5`가 라우터(`tcp/localhost:7447`)를 통한 연결을 요구하는데, 로컬 개발 환경에 라우터가 없음.
+
+**해결**:
+- `train_tqc.py`의 `_setup_zenoh()`이 `rmw_zenohd` 라우터를 자동 시작하고 pixi 쪽 `ZENOH_CONFIG_OVERRIDE`에 connect endpoint를 주입
+- distrobox 쪽은 `run_mujoco_dev.sh`로 MuJoCo를 시작해야 같은 라우터를 바라봄
+
+```bash
+# distrobox (터미널 1)
+bash ~/ws_aic/src/aic/my_policy/scripts/run_mujoco_dev.sh
+
+# pixi (터미널 2)
+cd ~/ws_aic/src/aic && pixi run python3 my_policy/scripts/train_tqc.py --mode state
+```
+
+---
+
+### 문제 2: Home reset이 로봇을 실제로 이동시키지 않음
+
+**증상**: `[AICEnv] Home reset 실행 중...` 출력되지만 로봇이 home 위치로 돌아가지 않음
+
+**원인**: `aic_controller`가 **target mode** 시스템을 사용함.
+
+- `MODE_CARTESIAN`(=1) 상태에서는 `JointMotionUpdate` 메시지를 **완전히 무시**함 (IDL 명시)
+- velocity 명령(`MotionUpdate`)을 보낸 후 controller는 Cartesian 모드 유지
+- `AICEnvNode`가 모드 전환 없이 joint 명령을 발행 → 컨트롤러가 드롭
+
+**해결**: `ChangeTargetMode` 서비스 클라이언트를 `AICEnvNode`에 추가
+
+```python
+# send_home_position() 내부
+self._set_target_mode(TargetMode.MODE_JOINT)   # MODE_JOINT(=2)로 전환
+# ... joint 명령 발행 루프 ...
+self._set_target_mode(TargetMode.MODE_CARTESIAN)  # 복귀
+
+# send_velocity() 내부
+self._set_target_mode(TargetMode.MODE_CARTESIAN)  # 이미 설정됐으면 no-op
+```
+
+`aic_model.py`의 `handle_joint_motion_update()`가 동일하게 `set_target_mode(MODE_JOINT)`를 호출하는 것을 확인하여 원인 특정.
+
+---
+
+### 문제 3: 매 에피소드가 1 스텝 만에 종료 ("초기 행동이 항상 똑같아 보임")
+
+**증상**: `total_timesteps=4` for `episodes=4`, 매 에피소드마다 Home reset
+
+**원인**: `MAX_DIST_FROM_PORT=0.7m`이 home 위치에서 SFP 포트까지의 실제 거리보다 작음.
+- home 위치에서의 첫 번째 step이 즉시 `out_of_bounds=True` → `truncated=True`
+- robot이 매번 home으로 돌아갔다가 2.5mm 이동 후 다시 종료 → 시각적으로 동일해 보임
+
+**왜 "같은 행동"처럼 보이냐**: action 자체는 정상 랜덤(`np.random.default_rng()` + OS entropy).
+하지만 `VEL_LIMIT=0.05 m/s × dt=0.05s = 2.5mm` 이동 후 즉시 종료되어 로봇이 거의 안 움직임.
+
+**해결**: `out_of_bounds` 기반 truncation 제거.
+- `floor_hit`만 진짜 충돌로 처리 → home reset 트리거
+- `out_of_bounds`는 dense reward(`-dist`)가 자연스럽게 패널티 제공하므로 hard cutoff 불필요
+
+```python
+# 수정 전
+collision = floor_hit or out_of_bounds
+truncated = step >= MAX_STEPS or collision
+
+# 수정 후
+if floor_hit:
+    self._needs_home_reset = True
+truncated = step >= MAX_STEPS or floor_hit
+```
